@@ -17327,7 +17327,6 @@ local function main()
 		return table.concat(lines,"\n")
 	end
 
-	local "    " = "    "  -- 4 spaces per level
 	
 	local function _ppImpl(text)
 		local result = {}
