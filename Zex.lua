@@ -1731,9 +1731,9 @@ local function main()
 		end
 
 		if presentClasses["LuaSourceContainer"] then
-			context:AddRegistered("VIEW_SCRIPT", not presentClasses.isViableDecompileScript or env.decompile == nil)
+			context:AddRegistered("VIEW_SCRIPT", not presentClasses.isViableDecompileScript or env.getscriptbytecode == nil)
 			context:AddRegistered("DUMP_FUNCTIONS", not presentClasses.isViableDecompileScript or env.getupvalues == nil or env.getconstants == nil)
-			context:AddRegistered("SAVE_SCRIPT", not presentClasses.isViableDecompileScript or env.decompile == nil or env.writefile == nil)
+			context:AddRegistered("SAVE_SCRIPT", not presentClasses.isViableDecompileScript or env.getscriptbytecode == nil or env.writefile == nil)
 			context:AddRegistered("SAVE_BYTECODE", not presentClasses.isViableDecompileScript or env.getscriptbytecode == nil or env.writefile == nil)
 			context:AddRegistered("RE_CLOSURE_INSPECTOR")
 		end
@@ -2436,12 +2436,32 @@ end
 		context:Register("SAVE_SCRIPT",{Name = "Save Script", IconMap = Explorer.MiscIcons, Icon = "Save", DisabledIcon = "Empty", OnClick = function()
 			for _, v in next, selection.List do
 				if v.Obj:IsA("LuaSourceContainer") and env.isViableDecompileScript(v.Obj) then
-					local success, source = pcall(env.decompile, v.Obj)
-					if not success or not source then source = ("-- DEX - %s failed to decompile %s"):format(env.executor, v.Obj.ClassName) end
+					local source = nil
+					-- zukv2 path
+					local okBC, bytecode = pcall(env.getscriptbytecode, v.Obj)
+					if okBC and bytecode and bytecode ~= "" then
+						local opts = {
+							DecompilerMode="disasm", DecompilerTimeout=15,
+							ReaderFloatPrecision=7, ShowDebugInformation=false,
+							ShowTrivialOperations=false, ShowInstructionLines=true,
+							ShowOperationIndex=true, ShowOperationNames=true,
+							ListUsedGlobals=true, UseTypeInfo=true,
+							EnabledRemarks={ColdRemark=false,InlineRemark=true},
+							ReturnElapsedTime=false,
+						}
+						local okD, result = pcall(env.ZukDecompile or getgenv()._ZUK_DECOMPILE or function() end, bytecode, opts)
+						if okD and result then source = result end
+					end
+					-- fallback to env.decompile (Konstant) if bytecode path failed
+					if not source then
+						local ok2, res2 = pcall(env.decompile, v.Obj)
+						if ok2 and res2 then source = res2 end
+					end
+					if not source then
+						source = ("-- DEX - failed to decompile %s"):format(v.Obj.ClassName)
+					end
 					local fileName = ("%s_%s_%i_Source.txt"):format(env.parsefile(v.Obj.Name), v.Obj.ClassName, game.PlaceId)
-
 					Lib.SaveAsPrompt(fileName, source)
-					
 					task.wait(0.2)
 				end
 			end
@@ -4550,21 +4570,47 @@ end
 				end
 			end
 
+			local function zukDecompileObj(target)
+				local okBC, bytecode = pcall(env.getscriptbytecode, target)
+				if not (okBC and bytecode and bytecode ~= "") then return nil end
+				local opts = {
+					DecompilerMode="disasm", DecompilerTimeout=15,
+					ReaderFloatPrecision=7, ShowDebugInformation=false,
+					ShowTrivialOperations=false, ShowInstructionLines=true,
+					ShowOperationIndex=true, ShowOperationNames=true,
+					ListUsedGlobals=true, UseTypeInfo=true,
+					EnabledRemarks={ColdRemark=false,InlineRemark=true},
+					ReturnElapsedTime=false,
+				}
+				local okD, result = pcall(env.ZukDecompile or getgenv()._ZUK_DECOMPILE or function() end, bytecode, opts)
+				return (okD and result and #result > 0) and result or nil
+			end
+
 			local source
-			if found and env.decompile then
-				-- decompile the actual loaded closure
-				local ok, result = pcall(env.decompile, found)
-				if ok and result and #result > 0 then
+			-- Strategy 1: decompile the loaded closure found via GC
+			if found then
+				local result = zukDecompileObj(found)
+				-- fallback: env.decompile on the closure
+				if not result and env.decompile then
+					local ok, res = pcall(env.decompile, found)
+					if ok and res and #res > 0 then result = res end
+				end
+				if result then
 					source = "-- [Auto-Decompile] Loaded closure found via GC\n"
 					source = source .. "-- Module: " .. Explorer.GetInstancePath(obj) .. "\n\n"
 					source = source .. result
 				end
 			end
 
-			-- Strategy 2: fall back to decompiling the ModuleScript instance directly
-			if not source and env.decompile then
-				local ok, result = pcall(env.decompile, obj)
-				if ok and result and #result > 0 then
+			-- Strategy 2: decompile the ModuleScript instance directly
+			if not source then
+				local result = zukDecompileObj(obj)
+				-- fallback: env.decompile on the instance
+				if not result and env.decompile then
+					local ok, res = pcall(env.decompile, obj)
+					if ok and res and #res > 0 then result = res end
+				end
+				if result then
 					source = "-- [Auto-Decompile] Decompiled ModuleScript instance\n"
 					source = source .. "-- Module: " .. Explorer.GetInstancePath(obj) .. "\n\n"
 					source = source .. result
@@ -17103,6 +17149,7 @@ local function main()
 		return table.concat(lines,"\n")
 	end
 		ZukDecompile = Decompile
+		getgenv()._ZUK_DECOMPILE = Decompile  -- expose for env.decompile override
 	end
 	-- ─────────────────────────────────────────────────────────────────
 
@@ -17894,6 +17941,35 @@ Main = (function()
 			env.decompile = decompile
 			return decompile
 		end)()
+
+		-- ── Expose ZukDecompile on env and override env.decompile ───────────
+		-- ScriptViewer stores ZukDecompile in _G._ZUK_DECOMPILE (set in main()).
+		-- We patch env.decompile so every legacy caller (SAVE_SCRIPT, etc.)
+		-- gets our local decompiler first, Konstant only as a last resort.
+		task.defer(function()
+			local zuk = getgenv()._ZUK_DECOMPILE
+			if not zuk then return end
+			env.ZukDecompile = zuk
+			local _konstant = env.decompile
+			env.decompile = function(scriptObj)
+				local okBC, bytecode = pcall(env.getscriptbytecode, scriptObj)
+				if okBC and bytecode and bytecode ~= "" then
+					local opts = {
+						DecompilerMode="disasm", DecompilerTimeout=15,
+						ReaderFloatPrecision=7, ShowDebugInformation=false,
+						ShowTrivialOperations=false, ShowInstructionLines=true,
+						ShowOperationIndex=true, ShowOperationNames=true,
+						ListUsedGlobals=true, UseTypeInfo=true,
+						EnabledRemarks={ColdRemark=false, InlineRemark=true},
+						ReturnElapsedTime=false,
+					}
+					local okD, result = pcall(zuk, bytecode, opts)
+					if okD and result then return result end
+				end
+				-- bytecode unavailable or decompiler failed — fall back to Konstant
+				if _konstant then return _konstant(scriptObj) end
+			end
+		end)
 
 		if identifyexecutor then
 			Main.Executor = identifyexecutor()
