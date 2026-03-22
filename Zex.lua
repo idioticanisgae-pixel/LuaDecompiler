@@ -2438,7 +2438,8 @@ end
 				if v.Obj:IsA("LuaSourceContainer") and env.isViableDecompileScript(v.Obj) then
 					local source = nil
 					-- zukv2 path
-					local okBC, bytecode = pcall(env.getscriptbytecode, v.Obj)
+					local bytecode = env.getBytecode and env.getBytecode(v.Obj)
+					local okBC = bytecode ~= nil
 					if okBC and bytecode and bytecode ~= "" then
 						local opts = {
 							DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true, CleanMode=true,
@@ -2450,7 +2451,7 @@ end
 							ReturnElapsedTime=false,
 						}
 						local okD, result = pcall(env.ZukDecompile or getgenv()._ZUK_DECOMPILE or function() end, bytecode, opts)
-						if okD and result then source = prettyPrint(result) end
+						if okD and result then source = cleanOutput(prettyPrint(result)) end
 					end
 					-- fallback to env.decompile (Konstant) if bytecode path failed
 					if not source then
@@ -4688,7 +4689,8 @@ end
 			end
 
 			local function zukDecompileObj(target)
-				local okBC, bytecode = pcall(env.getscriptbytecode, target)
+				local bytecode = env.getBytecode and env.getBytecode(target)
+				local okBC = bytecode ~= nil
 				if not (okBC and bytecode and bytecode ~= "") then return nil end
 				local opts = {
 					DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true, CleanMode=true,
@@ -4701,7 +4703,7 @@ end
 				}
 				local okD, result = pcall(env.ZukDecompile or getgenv()._ZUK_DECOMPILE or function() end, bytecode, opts)
 				local out = (okD and result and #result > 0) and result or nil
-				return out and prettyPrint(out) or nil
+				return out and cleanOutput(prettyPrint(out)) or nil
 			end
 
 			local source
@@ -15973,6 +15975,7 @@ local function main()
 	-- ── zukv2 decompiler core ──────────────────────────────────────────
 	local ZukDecompile
 	local prettyPrint
+	local cleanOutput
 	task.defer(function()
 	local FLOAT_PRECISION = 7
 	local Reader = {}
@@ -17388,10 +17391,83 @@ local function main()
 		return table.concat(result)
 	end
 
+	local function _coImpl(text)
+		-- ── Post-process: collapse noisy disasm patterns ────────────────────
+		local rawLines = {}
+		for line in (text .. "\n"):gmatch("[^\n]*\n") do
+			rawLines[#rawLines + 1] = line:gsub("\n$", "")
+		end
+
+		-- Pass 1: collapse single-use constant loads into the next usage line
+		-- e.g. v2 = "RunService" / v0 = v0:GetService(v2) → v0 = v0:GetService("RunService")
+		local function tryCollapse(i)
+			local line = rawLines[i]
+			if line == nil then return false end
+			local reg, lit = line:match('^%s*(v%d+) = (".-")%s*$')
+			if not reg then reg, lit = line:match('^%s*(v%d+) = (%-?%d+%.?%d*)%s*$') end
+			if not reg then return false end
+			local j = i + 1
+			while j <= #rawLines and (rawLines[j] == nil or rawLines[j]:match("^%s*$")) do
+				j += 1
+			end
+			if j > #rawLines or rawLines[j] == nil then return false end
+			local nextLine = rawLines[j]
+			local escaped = reg:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
+			local count = 0
+			for _ in nextLine:gmatch(escaped) do count += 1 end
+			if count ~= 1 then return false end
+			if nextLine:match("^%s*" .. escaped .. "%s*=") then return false end
+			rawLines[j] = nextLine:gsub(escaped, lit, 1)
+			rawLines[i] = nil
+			return true
+		end
+		for _ = 1, 4 do
+			for i = 1, #rawLines do tryCollapse(i) end
+		end
+
+		-- Pass 2: strip comment noise
+		local pass2 = {}
+		for idx = 1, #rawLines do
+			local line = rawLines[idx]
+			if line == nil then continue end
+			local stripped = line:match("^%s*(.-)%s*$")
+			-- drop standalone goto comment lines
+			if stripped:match("^%-%- goto #%d+$") then continue end
+			-- drop jump comments
+			if stripped:match("^%-%- jump") then continue end
+			-- strip inline noise from the end of lines
+			line = line:gsub("%s*%-%- goto #%d+$", "")
+			line = line:gsub("%s*%-%- end at #%d+$", "")
+			line = line:gsub("%s*%-%- iterate %+ jump to #%d+$", "")
+			pass2[#pass2 + 1] = line
+		end
+
+		-- Pass 3: drop vN = nil lines immediately before a for loop
+		local final = {}
+		local i = 1
+		while i <= #pass2 do
+			local line = pass2[i]
+			local nxt  = pass2[i + 1]
+			local s    = line and line:match("^%s*(.-)%s*$") or ""
+			local isNilInit = s:match("^v%d+ = nil") ~= nil
+			local nextIsFor = nxt and nxt:match("^%s*for%s+v%d+") ~= nil
+			if isNilInit and nextIsFor then
+				i += 1
+			else
+				final[#final + 1] = line
+				i += 1
+			end
+		end
+
+		return table.concat(final, "\n")
+	end
+
 		ZukDecompile = Decompile
 		prettyPrint  = _ppImpl
+		cleanOutput  = _coImpl
 		getgenv()._ZUK_DECOMPILE    = Decompile
 		getgenv()._ZUK_PRETTYPRINT  = _ppImpl
+		getgenv()._ZUK_CLEANOUTPUT  = _coImpl
 	end)
 	-- ─────────────────────────────────────────────────────────────────
 
@@ -17613,9 +17689,32 @@ local function main()
 		-- if ZukDecompile hasn't initialised yet (task.defer still pending), wait one frame
 		if not ZukDecompile then
 			local deadline = tick() + 5
-			repeat task.wait() until ZukDecompile or tick() > deadline
+			repeat task.wait() until (ZukDecompile and cleanOutput) or tick() > deadline
 		end
 		local okBC, bytecode = pcall(getscriptbytecode, scr)
+		-- CorePackages/CoreGui: instance-level getscriptbytecode returns nothing
+		-- because the service is locked. Find the loaded closure via getloadedmodules()
+		-- and call getscriptbytecode on that instead.
+		if (not bytecode or bytecode == "") and getloadedmodules then
+			local ok2, mods = pcall(getloadedmodules)
+			if ok2 and mods then
+				for _, mod in ipairs(mods) do
+					local ok3, name = pcall(function() return mod.Name end)
+					if ok3 and name == scr.Name then
+						local ok4, fullA = pcall(function() return mod:GetFullName() end)
+						local ok5, fullB = pcall(function() return scr:GetFullName() end)
+						local match = (ok4 and ok5 and fullA == fullB) or (not ok4 or not ok5)
+						if match then
+							local ok6, bc = pcall(getscriptbytecode, mod)
+							if ok6 and bc and bc ~= "" then
+								bytecode = bc; okBC = true
+								break
+							end
+						end
+					end
+				end
+			end
+		end
 		if ZukDecompile and okBC and bytecode and bytecode ~= "" then
 			local opts = {
 				DecompilerMode        = "disasm",
@@ -17637,7 +17736,7 @@ local function main()
 				source = "-- Script Path: "..getPath(scr).."\n"
 				source = source.."-- Took "..tostring(math.floor((tick()-oldtick)*100)/100).."s\n"
 				source = source.."-- Decompiler: zukv2\n\n"
-				source = source..prettyPrint(result)
+				source = source..cleanOutput(prettyPrint(result))
 				PreviousScr = scr
 				dumpbtn.TextColor3 = Color3.new(1,1,1)
 			end
@@ -18061,6 +18160,31 @@ Main = (function()
 		env.hookmetamethod = hookmetamethod
 
 		env.getscriptbytecode = getscriptbytecode
+
+		-- Wrapper that falls back to getloadedmodules for CorePackages/CoreGui scripts
+		env.getBytecode = function(scr)
+			local ok, bc = pcall(getscriptbytecode, scr)
+			if ok and bc and bc ~= "" then return bc end
+			-- try loaded modules path for locked services
+			if getloadedmodules then
+				local ok2, mods = pcall(getloadedmodules)
+				if ok2 and mods then
+					for _, mod in ipairs(mods) do
+						local ok3, name = pcall(function() return mod.Name end)
+						if ok3 and name == scr.Name then
+							local ok4, fullA = pcall(function() return mod:GetFullName() end)
+							local ok5, fullB = pcall(function() return scr:GetFullName() end)
+							local match = (ok4 and ok5 and fullA == fullB) or (not ok4 or not ok5)
+							if match then
+								local ok6, bc2 = pcall(getscriptbytecode, mod)
+								if ok6 and bc2 and bc2 ~= "" then return bc2 end
+							end
+						end
+					end
+				end
+			end
+			return nil
+		end
 		env.setfflag = setfflag
 		env.protectgui = protect_gui or (syn and syn.protect_gui)
 		env.gethui = gethui
@@ -18117,7 +18241,8 @@ Main = (function()
 					local okD, result = pcall(zuk, bytecode, opts)
 					if okD and result then
 						local _pp = getgenv()._ZUK_PRETTYPRINT
-						return _pp and _pp(result) or result
+						local _co = getgenv()._ZUK_CLEANOUTPUT
+						return (_pp and _co) and _co(_pp(result)) or (_pp and _pp(result)) or result
 					end
 				end
 				-- bytecode unavailable or decompiler failed — fall back to Konstant
