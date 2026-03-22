@@ -2441,7 +2441,7 @@ end
 					local okBC, bytecode = pcall(env.getscriptbytecode, v.Obj)
 					if okBC and bytecode and bytecode ~= "" then
 						local opts = {
-							DecompilerMode="disasm", DecompilerTimeout=15,
+							DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true,
 							ReaderFloatPrecision=7, ShowDebugInformation=false,
 							ShowTrivialOperations=false, ShowInstructionLines=true,
 							ShowOperationIndex=true, ShowOperationNames=true,
@@ -4124,7 +4124,7 @@ end
 				local okBC, bytecode = pcall(env.getscriptbytecode, scriptObj)
 				if zuk and okBC and bytecode and bytecode ~= "" then
 					local opts = {
-						DecompilerMode="disasm", DecompilerTimeout=15,
+						DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true,
 						ReaderFloatPrecision=7, ShowDebugInformation=false,
 						ShowTrivialOperations=false, ShowInstructionLines=true,
 						ShowOperationIndex=true, ShowOperationNames=true,
@@ -4691,7 +4691,7 @@ end
 				local okBC, bytecode = pcall(env.getscriptbytecode, target)
 				if not (okBC and bytecode and bytecode ~= "") then return nil end
 				local opts = {
-					DecompilerMode="disasm", DecompilerTimeout=15,
+					DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true,
 					ReaderFloatPrecision=7, ShowDebugInformation=false,
 					ShowTrivialOperations=false, ShowInstructionLines=true,
 					ShowOperationIndex=true, ShowOperationNames=true,
@@ -15970,8 +15970,9 @@ end
 
 local function main()
 
-	-- ── zukv2 decompiler core ──────────────────────────────────────────
+	-- ── zukv2 decompiler core (updated) ──────────────────────────────
 	local ZukDecompile
+	local prettyPrint
 	do
 	local FLOAT_PRECISION = 7
 	local Reader = {}
@@ -16029,15 +16030,8 @@ local function main()
 		return self
 	end
 	function Reader:Set(fp) FLOAT_PRECISION = fp end
-	local MemeStrings = {
-		" decompiled with zukas decompiler",
-		" DISASSEMBLED...",
-		" params : ...",
-		" " .. os.date(),
-		" zukv2",
-	}
 	local Strings = {
-		SUCCESS              = "--" .. MemeStrings[math.random(#MemeStrings)] .. "\n%s",
+		SUCCESS              = "%s",  -- no meme header; callers add their own metadata
 		TIMEOUT              = "-- DECOMPILER TIMEOUT",
 		COMPILATION_FAILURE  = "-- SCRIPT FAILED TO COMPILE, ERROR:\n%s",
 		UNSUPPORTED_LBC_VERSION = "-- PASSED BYTECODE IS TOO OLD AND IS NOT SUPPORTED",
@@ -16233,14 +16227,15 @@ local function main()
 		DecompilerTimeout    = 10,
 		DecompilerMode       = "disasm",
 		ReaderFloatPrecision = 7,
-		ShowDebugInformation = true,
-		ShowInstructionLines = true,
-		ShowOperationIndex   = true,
-		ShowOperationNames   = true,
+		ShowDebugInformation = false,
+		ShowInstructionLines = false,
+		ShowOperationIndex   = false,
+		ShowOperationNames   = false,
 		ShowTrivialOperations= false,
 		UseTypeInfo          = true,
 		ListUsedGlobals      = true,
 		ReturnElapsedTime    = false,
+		CleanMode            = true,  -- strip prefix, use debug names, suppress boilerplate
 	}
 	local LuauCompileUserdataInfo = true
 	pcall(function()
@@ -16665,14 +16660,57 @@ local function main()
 					totalParameters += numParams
 					if proto.main and pflags and pflags.native then emit("--!native\n") end
 	
-					local function fmtReg(r)
+					-- ── Debug name lookups ────────────────────────────────────────────
+					-- Build register-name map from debugLocals: reg → name at a given PC
+					local function buildRegNames(instrIdx)
+						local names = {}
+						if proto.debugLocals then
+							for _, dl in ipairs(proto.debugLocals) do
+								if instrIdx >= dl.startPC and instrIdx <= dl.endPC then
+									names[dl.register] = dl.name
+								end
+							end
+						end
+						return names
+					end
+					-- Upvalue names from debugUpvalues
+					local function fmtUpv(r)
+						local du = proto.debugUpvalues
+						if du and du[r+1] and du[r+1].name ~= "" then
+							return du[r+1].name
+						end
+						return "upv_"..r
+					end
+					-- Register name: prefer debug name, fall back to p/v scheme
+					local regNameCache = {}
+					local function fmtReg(r, instrIdx)
+						if instrIdx and proto.debugLocals then
+							local cached = regNameCache[instrIdx]
+							if not cached then
+								cached = buildRegNames(instrIdx)
+								regNameCache[instrIdx] = cached
+							end
+							if cached[r] and cached[r] ~= "" then
+								return cached[r]
+							end
+						end
 						local pr = r+1
 						if pr < numParams+1 then
 							return "p"..((totalParameters-numParams)+pr)
 						end
 						return "v"..(r-numParams)
 					end
-					local function fmtUpv(r) return "u_v"..r end
+					-- Param name helper (for fmtProto)
+					local function paramName(j)
+						if proto.debugLocals then
+							for _, dl in ipairs(proto.debugLocals) do
+								if dl.startPC == 0 and dl.register == j-1 then
+									return dl.name
+								end
+							end
+						end
+						return "p"..(totalParameters+j)
+					end
 					local function fmtConst(k)
 						if not k then return "nil" end
 						if k.type == LuauBytecodeTag.LBC_CONSTANT_VECTOR then
@@ -16696,7 +16734,7 @@ local function main()
 						else body="function" end
 						body ..= "("
 						for j=1,p.numParams do
-							local pb="p"..(totalParameters+j)
+							local pb=paramName(j)
 							if p.hasTypeInfo and options.UseTypeInfo and p.typedParams and p.typedParams[j] then
 								pb ..= ": "..Luau:GetBaseTypeString(p.typedParams[j],true)
 							end
@@ -16735,6 +16773,12 @@ local function main()
 	
 						end
 					end
+					-- Instructions that are pure VM bookkeeping in clean mode
+					local CLEAN_SUPPRESS = {
+						CLOSEUPVALS=true, PREPVARARGS=true, COVERAGE=true,
+						CAPTURE=true, FASTCALL=true, FASTCALL1=true,
+						FASTCALL2=true, FASTCALL2K=true, FASTCALL3=true,
+					}
 					for i, action in ipairs(actions) do
 						if action.hide then continue end
 						local ur  = action.usedRegisters
@@ -16742,6 +16786,23 @@ local function main()
 						local oci = action.opCode
 						if not oci then continue end
 						local opn = oci.name
+						-- clean mode: skip pure bookkeeping ops
+						if options.CleanMode and CLEAN_SUPPRESS[opn] then continue end
+						-- clean mode: skip bare RETURN with no value at end of proto
+						if options.CleanMode and opn == "RETURN" then
+							local b = ed and ed[1] or 0
+							if b == 1 then continue end  -- RETURN with B=1 means return nothing
+						end
+						-- clean mode: skip MOVE that just wires up a closure assignment
+						-- (those are handled inside writeProto already)
+						if options.CleanMode and opn == "MOVE" and
+						   i > 1 and actions[i-1] and
+						   (actions[i-1].opCode.name == "NEWCLOSURE" or
+						    actions[i-1].opCode.name == "DUPCLOSURE") then
+							continue
+						end
+						-- resolve register names at this instruction index
+						local function R(r) return fmtReg(r, i) end
 						local function handleJumps()
 							local n = jumpMarkers[i]
 							if n then
@@ -16750,48 +16811,47 @@ local function main()
 	
 							end
 						end
-						if options.ShowOperationIndex then
-							emit("["..padLeft(i,"0",3).."] ")
-	
+						if not options.CleanMode then
+							if options.ShowOperationIndex then
+								emit("["..padLeft(i,"0",3).."] ")
+							end
+							if options.ShowInstructionLines and lineInfo and lineInfo[i] then
+								emit(":"..padLeft(lineInfo[i],"0",3)..":")
+							end
+							if options.ShowOperationNames then
+								emit(padRight(opn," ",15))
+							end
 						end
-						if options.ShowInstructionLines and lineInfo and lineInfo[i] then
-							emit(":"..padLeft(lineInfo[i],"0",3)..":")
-	
-						end
-						if options.ShowOperationNames then
-							emit(padRight(opn," ",15))
-	
-						end
-						if opn=="LOADNIL" then emit(fmtReg(ur[1]).." = nil")
+						if opn=="LOADNIL" then emit(R(ur[1]).." = nil")
 	
 						elseif opn=="LOADB" then
-							emit(fmtReg(ur[1]).." = "..toEscapedString(toBoolean(ed[1])))
+							emit(R(ur[1]).." = "..toEscapedString(toBoolean(ed[1])))
 	
 							if ed[2]~=0 then emit(" +"..ed[2]) end
 	
-						elseif opn=="LOADN" then emit(fmtReg(ur[1]).." = "..ed[1])
+						elseif opn=="LOADN" then emit(R(ur[1]).." = "..ed[1])
 	
-						elseif opn=="LOADK" then emit(fmtReg(ur[1]).." = "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="LOADK" then emit(R(ur[1]).." = "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="MOVE"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]))
+						elseif opn=="MOVE"  then emit(R(ur[1]).." = "..R(ur[2]))
 	
 						elseif opn=="GETGLOBAL" then
 							local gk=tostring(consts[ed[1]+1] and consts[ed[1]+1].value or "")
 							if options.ListUsedGlobals and isValidGlobal(gk) then
 								table.insert(usedGlobals,gk); usedGlobalsSet[gk]=true
 							end
-							emit(fmtReg(ur[1]).." = "..gk)
+							emit(R(ur[1]).." = "..gk)
 	
 						elseif opn=="SETGLOBAL" then
 							local gk=tostring(consts[ed[1]+1] and consts[ed[1]+1].value or "")
 							if options.ListUsedGlobals and isValidGlobal(gk) then
 								table.insert(usedGlobals,gk); usedGlobalsSet[gk]=true
 							end
-							emit(gk.." = "..fmtReg(ur[1]))
+							emit(gk.." = "..R(ur[1]))
 	
-						elseif opn=="GETUPVAL" then emit(fmtReg(ur[1]).." = "..fmtUpv(caps[ed[1]]))
+						elseif opn=="GETUPVAL" then emit(R(ur[1]).." = "..fmtUpv(caps[ed[1]]))
 	
-						elseif opn=="SETUPVAL" then emit(fmtUpv(caps[ed[1]]).." = "..fmtReg(ur[1]))
+						elseif opn=="SETUPVAL" then emit(fmtUpv(caps[ed[1]]).." = "..R(ur[1]))
 	
 						elseif opn=="CLOSEUPVALS" then emit("-- clear captures from back until: "..ur[1])
 	
@@ -16801,27 +16861,27 @@ local function main()
 							if totalIdx==1 and options.ListUsedGlobals and isValidGlobal(imp) then
 								table.insert(usedGlobals,imp); usedGlobalsSet[imp]=true
 							end
-							emit(fmtReg(ur[1]).." = "..imp)
+							emit(R(ur[1]).." = "..imp)
 	
 						elseif opn=="GETTABLE" then
-							emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).."["..fmtReg(ur[3]).."]")
+							emit(R(ur[1]).." = "..R(ur[2]).."["..R(ur[3]).."]")
 	
 						elseif opn=="SETTABLE" then
-							emit(fmtReg(ur[2]).."["..fmtReg(ur[3]).."] = "..fmtReg(ur[1]))
+							emit(R(ur[2]).."["..R(ur[3]).."] = "..R(ur[1]))
 	
 						elseif opn=="GETTABLEKS" then
 							local key = consts[ed[2]+1] and consts[ed[2]+1].value
-							emit(fmtReg(ur[1]).." = "..fmtReg(ur[2])..formatIndexString(key))
+							emit(R(ur[1]).." = "..R(ur[2])..formatIndexString(key))
 	
 						elseif opn=="SETTABLEKS" then
 							local key = consts[ed[2]+1] and consts[ed[2]+1].value
-							emit(fmtReg(ur[2])..formatIndexString(key).." = "..fmtReg(ur[1]))
+							emit(R(ur[2])..formatIndexString(key).." = "..R(ur[1]))
 	
 						elseif opn=="GETTABLEN" then
-							emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).."["..(ed[1]+1).."]")
+							emit(R(ur[1]).." = "..R(ur[2]).."["..(ed[1]+1).."]")
 	
 						elseif opn=="SETTABLEN" then
-							emit(fmtReg(ur[2]).."["..(ed[1]+1).."] = "..fmtReg(ur[1]))
+							emit(R(ur[2]).."["..(ed[1]+1).."] = "..R(ur[1]))
 	
 						elseif opn=="NEWCLOSURE" then
 							local p2=inner[ed[1]+1]; if p2 then writeProto(ur[1],p2) end
@@ -16848,17 +16908,17 @@ local function main()
 							elseif nRes>0 then
 								local rb=""
 								for k=1,nRes do
-									rb..=fmtReg(baseR+k-1)
+									rb..=R(baseR+k-1)
 									if k~=nRes then rb..=", " end
 								end
 								callBody=rb.." = "
 							end
-							callBody ..= fmtReg(baseR)..nmMethod.."("
+							callBody ..= R(baseR)..nmMethod.."("
 							if nArgs==-1 then callBody..="..."
 							elseif nArgs>0 then
 								local ab=""
 								for k=1,nArgs do
-									ab..=fmtReg(baseR+k+argOff)
+									ab..=R(baseR+k+argOff)
 									if k~=nArgs then ab..=", " end
 								end
 								callBody..=ab
@@ -16869,11 +16929,11 @@ local function main()
 						elseif opn=="RETURN" then
 							local baseR=ur[1]; local tot=ed[1]-2
 							local rb=""
-							if tot==-2 then rb=" "..fmtReg(baseR)..", ..."
+							if tot==-2 then rb=" "..R(baseR)..", ..."
 							elseif tot>-1 then
 								rb=" "
 								for k=0,tot do
-									rb..=fmtReg(baseR+k)
+									rb..=R(baseR+k)
 									if k~=tot then rb..=", " end
 								end
 							end
@@ -16885,67 +16945,67 @@ local function main()
 	
 						elseif opn=="JUMPIF" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if not "..fmtReg(ur[1]).." then -- goto #"..ei)
+							emit("if not "..R(ur[1]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFNOT" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFEQ" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." == "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." == "..R(ur[2]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFLE" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." >= "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." >= "..R(ur[2]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFLT" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." > "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." > "..R(ur[2]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFNOTEQ" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." ~= "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." ~= "..R(ur[2]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFNOTLE" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." <= "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." <= "..R(ur[2]).." then -- goto #"..ei)
 	
 						elseif opn=="JUMPIFNOTLT" then
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." < "..fmtReg(ur[2]).." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." < "..R(ur[2]).." then -- goto #"..ei)
 	
-						elseif opn=="ADD"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." + "..fmtReg(ur[3]))
+						elseif opn=="ADD"  then emit(R(ur[1]).." = "..R(ur[2]).." + "..R(ur[3]))
 	
-						elseif opn=="SUB"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." - "..fmtReg(ur[3]))
+						elseif opn=="SUB"  then emit(R(ur[1]).." = "..R(ur[2]).." - "..R(ur[3]))
 	
-						elseif opn=="MUL"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." * "..fmtReg(ur[3]))
+						elseif opn=="MUL"  then emit(R(ur[1]).." = "..R(ur[2]).." * "..R(ur[3]))
 	
-						elseif opn=="DIV"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." / "..fmtReg(ur[3]))
+						elseif opn=="DIV"  then emit(R(ur[1]).." = "..R(ur[2]).." / "..R(ur[3]))
 	
-						elseif opn=="MOD"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." % "..fmtReg(ur[3]))
+						elseif opn=="MOD"  then emit(R(ur[1]).." = "..R(ur[2]).." % "..R(ur[3]))
 	
-						elseif opn=="POW"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." ^ "..fmtReg(ur[3]))
+						elseif opn=="POW"  then emit(R(ur[1]).." = "..R(ur[2]).." ^ "..R(ur[3]))
 	
-						elseif opn=="ADDK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." + "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="ADDK" then emit(R(ur[1]).." = "..R(ur[2]).." + "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="SUBK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." - "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="SUBK" then emit(R(ur[1]).." = "..R(ur[2]).." - "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="MULK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." * "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="MULK" then emit(R(ur[1]).." = "..R(ur[2]).." * "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="DIVK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." / "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="DIVK" then emit(R(ur[1]).." = "..R(ur[2]).." / "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="MODK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." % "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="MODK" then emit(R(ur[1]).." = "..R(ur[2]).." % "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="POWK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." ^ "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="POWK" then emit(R(ur[1]).." = "..R(ur[2]).." ^ "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="AND"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." and "..fmtReg(ur[3]))
+						elseif opn=="AND"  then emit(R(ur[1]).." = "..R(ur[2]).." and "..R(ur[3]))
 	
-						elseif opn=="OR"   then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." or "..fmtReg(ur[3]))
+						elseif opn=="OR"   then emit(R(ur[1]).." = "..R(ur[2]).." or "..R(ur[3]))
 	
-						elseif opn=="ANDK" then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." and "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="ANDK" then emit(R(ur[1]).." = "..R(ur[2]).." and "..fmtConst(consts[ed[1]+1]))
 	
-						elseif opn=="ORK"  then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." or "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="ORK"  then emit(R(ur[1]).." = "..R(ur[2]).." or "..fmtConst(consts[ed[1]+1]))
 	
 						elseif opn=="CONCAT" then
 							local tgt=table.remove(ur,1)
@@ -16953,16 +17013,16 @@ local function main()
 							for k,r in ipairs(ur) do
 								cb..=fmtReg(r); if k~=#ur then cb..=" .. " end
 							end
-							emit(fmtReg(tgt).." = "..cb)
+							emit(R(tgt).." = "..cb)
 	
-						elseif opn=="NOT"    then emit(fmtReg(ur[1]).." = not "..fmtReg(ur[2]))
+						elseif opn=="NOT"    then emit(R(ur[1]).." = not "..R(ur[2]))
 	
-						elseif opn=="MINUS"  then emit(fmtReg(ur[1]).." = -"..fmtReg(ur[2]))
+						elseif opn=="MINUS"  then emit(R(ur[1]).." = -"..R(ur[2]))
 	
-						elseif opn=="LENGTH" then emit(fmtReg(ur[1]).." = #"..fmtReg(ur[2]))
+						elseif opn=="LENGTH" then emit(R(ur[1]).." = #"..R(ur[2]))
 	
 						elseif opn=="NEWTABLE" then
-							emit(fmtReg(ur[1]).." = {}")
+							emit(R(ur[1]).." = {}")
 	
 							if options.ShowDebugInformation and ed[2] and ed[2]>0 then
 								emit(" ")
@@ -16976,27 +17036,27 @@ local function main()
 									tb..=fmtConst(consts[cv.value.keys[k]])
 									if k~=cv.value.size then tb..=", " end
 								end
-								emit(fmtReg(ur[1]).." = {} -- "..tb.."}")
+								emit(R(ur[1]).." = {} -- "..tb.."}")
 	
-							else emit(fmtReg(ur[1]).." = {}") end
+							else emit(R(ur[1]).." = {}") end
 	
 						elseif opn=="SETLIST" then
 							local tgt=ur[1]; local src=ur[2]
 							local si=ed[1]; local vc=ed[2]
 							if vc==0 then
-								emit(fmtReg(tgt).."["..si.."] = [...]")
+								emit(R(tgt).."["..si.."] = [...]")
 	
 							else
 								local tot2=#ur-1; local cb=""
 								for k=1,tot2 do
-									cb..=fmtReg(ur[k]).."["..(si+k-1).."] = "..fmtReg(src+k-1)
+									cb..=R(ur[k]).."["..(si+k-1).."] = "..R(src+k-1)
 									if k~=tot2 then cb..="\n" end
 								end
 								emit(cb)
 	
 							end
 						elseif opn=="FORNPREP" then
-							emit("for "..fmtReg(ur[3]).." = "..fmtReg(ur[3])..", "..fmtReg(ur[1])..", "..fmtReg(ur[2]).." do -- end at #"..(i+ed[1]))
+							emit("for "..R(ur[3]).." = "..R(ur[3])..", "..R(ur[1])..", "..R(ur[2]).." do -- end at #"..(i+ed[1]))
 						elseif opn=="FORNLOOP" then
 							emit("end -- iterate + jump to #"..(i+ed[1]))
 	
@@ -17005,11 +17065,11 @@ local function main()
 	
 						elseif opn=="FORGPREP_INEXT" then
 							local tr=ur[1]+1
-							emit("for "..fmtReg(tr+2)..", "..fmtReg(tr+3).." in ipairs("..fmtReg(tr)..") do")
+							emit("for "..R(tr+2)..", "..R(tr+3).." in ipairs("..R(tr)..") do")
 	
 						elseif opn=="FORGPREP_NEXT" then
 							local tr=ur[1]+1
-							emit("for "..fmtReg(tr+2)..", "..fmtReg(tr+3).." in pairs("..fmtReg(tr)..") do")
+							emit("for "..R(tr+2)..", "..R(tr+3).." in pairs("..R(tr)..") do")
 	
 						elseif opn=="FORGPREP" then
 							local ei=i+ed[1]+2
@@ -17020,22 +17080,22 @@ local function main()
 									vb..=fmtReg(r); if k~=#ea.usedRegisters then vb..=", " end
 								end
 							end
-							emit("for "..vb.." in "..fmtReg(ur[1]).." do -- end at #"..ei)
+							emit("for "..vb.." in "..R(ur[1]).." do -- end at #"..ei)
 	
 						elseif opn=="GETVARARGS" then
 							local vc2=ed[1]-1
 							local rb=""
-							if vc2==-1 then rb=fmtReg(ur[1])
+							if vc2==-1 then rb=R(ur[1])
 							else
 								for k=1,vc2 do
-									rb..=fmtReg(ur[k]); if k~=vc2 then rb..=", " end
+									rb..=R(ur[k]); if k~=vc2 then rb..=", " end
 								end
 							end
 							emit(rb.." = ...")
 	
 						elseif opn=="PREPVARARGS" then emit("-- ... ; number of fixed args: "..ed[1])
 	
-						elseif opn=="LOADKX" then emit(fmtReg(ur[1]).." = "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="LOADKX" then emit(R(ur[1]).." = "..fmtConst(consts[ed[1]+1]))
 	
 						elseif opn=="JUMPX"    then emit("-- jump to #"..(i+ed[1]))
 	
@@ -17045,14 +17105,14 @@ local function main()
 							local rev=bit32.rshift(ed[2] or 0,0x1F)~=1
 							local sign=rev and "~=" or "=="
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." "..sign.." nil then -- goto #"..ei)
+							emit("if "..R(ur[1]).." "..sign.." nil then -- goto #"..ei)
 	
 						elseif opn=="JUMPXEQKB" then
 							local val=tostring(toBoolean(bit32.band(ed[2] or 0,1)))
 							local rev=bit32.rshift(ed[2] or 0,0x1F)~=1
 							local sign=rev and "~=" or "=="
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." "..sign.." "..val.." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." "..sign.." "..val.." then -- goto #"..ei)
 	
 						elseif opn=="JUMPXEQKN" or opn=="JUMPXEQKS" then
 							local cidx=bit32.band(ed[2] or 0,0xFFFFFF)
@@ -17060,29 +17120,29 @@ local function main()
 							local rev=bit32.rshift(ed[2] or 0,0x1F)~=1
 							local sign=rev and "~=" or "=="
 							local ei=i+ed[1]; makeJump(ei)
-							emit("if "..fmtReg(ur[1]).." "..sign.." "..val.." then -- goto #"..ei)
+							emit("if "..R(ur[1]).." "..sign.." "..val.." then -- goto #"..ei)
 	
 						elseif opn=="CAPTURE"  then emit("-- upvalue capture")
 	
-						elseif opn=="SUBRK"    then emit(fmtReg(ur[1]).." = "..fmtConst(consts[ed[1]+1]).." - "..fmtReg(ur[2]))
+						elseif opn=="SUBRK"    then emit(R(ur[1]).." = "..fmtConst(consts[ed[1]+1]).." - "..R(ur[2]))
 	
-						elseif opn=="DIVRK"    then emit(fmtReg(ur[1]).." = "..fmtConst(consts[ed[1]+1]).." / "..fmtReg(ur[2]))
+						elseif opn=="DIVRK"    then emit(R(ur[1]).." = "..fmtConst(consts[ed[1]+1]).." / "..R(ur[2]))
 	
-						elseif opn=="IDIV"     then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." // "..fmtReg(ur[3]))
+						elseif opn=="IDIV"     then emit(R(ur[1]).." = "..R(ur[2]).." // "..R(ur[3]))
 	
-						elseif opn=="IDIVK"    then emit(fmtReg(ur[1]).." = "..fmtReg(ur[2]).." // "..fmtConst(consts[ed[1]+1]))
+						elseif opn=="IDIVK"    then emit(R(ur[1]).." = "..R(ur[2]).." // "..fmtConst(consts[ed[1]+1]))
 	
 						elseif opn=="FASTCALL" then emit("-- FASTCALL; "..Luau:GetBuiltinInfo(ed[1]).."()")
 	
-						elseif opn=="FASTCALL1" then emit("-- FASTCALL1; "..Luau:GetBuiltinInfo(ed[1]).."("..fmtReg(ur[1])..")")
+						elseif opn=="FASTCALL1" then emit("-- FASTCALL1; "..Luau:GetBuiltinInfo(ed[1]).."("..R(ur[1])..")")
 	
-						elseif opn=="FASTCALL2" then emit("-- FASTCALL2; "..Luau:GetBuiltinInfo(ed[1]).."("..fmtReg(ur[1])..", "..fmtReg(ur[2])..")")
+						elseif opn=="FASTCALL2" then emit("-- FASTCALL2; "..Luau:GetBuiltinInfo(ed[1]).."("..R(ur[1])..", "..R(ur[2])..")")
 	
 						elseif opn=="FASTCALL2K" then
-							emit("-- FASTCALL2K; "..Luau:GetBuiltinInfo(ed[1]).."("..fmtReg(ur[1])..", "..fmtConst(consts[(ed[3] or 0)+1])..")")
+							emit("-- FASTCALL2K; "..Luau:GetBuiltinInfo(ed[1]).."("..R(ur[1])..", "..fmtConst(consts[(ed[3] or 0)+1])..")")
 	
 						elseif opn=="FASTCALL3" then
-							emit("-- FASTCALL3; "..Luau:GetBuiltinInfo(ed[1]).."("..fmtReg(ur[1])..", "..fmtReg(ur[2])..", "..fmtReg(ur[3])..")")
+							emit("-- FASTCALL3; "..Luau:GetBuiltinInfo(ed[1]).."("..R(ur[1])..", "..R(ur[2])..", "..R(ur[3])..")")
 	
 						end
 						emit("\n")
@@ -17266,9 +17326,29 @@ local function main()
 		for i,proto in ipairs(parsed.protos) do walkProto(proto,i) end
 		return table.concat(lines,"\n")
 	end
+
+	local PP_INDENT = "    "  -- 4 spaces per level
+	
+	local function prettyPrint(text)
+		local result = {}
+		local depth  = 0
+	
+		local DEDENT_BEFORE      = { ["end"]=true, ["until"]=true }
+		local INDENT_AFTER       = { ["then"]=true, ["do"]=true, ["repeat"]=true }
+		local DEDENT_THEN_INDENT = { ["else"]=true, ["elseif"]=true }
+	
+		local function stripStrings(s)
+			-- remove string literals then line comments to get bare keyword tokens
+			s = s:gsub('"[^"\\]*(?:\\.[^"\\]*)*"', '""')
+			s = s:gsub("'[^'\\]*(?:\\.[^'\\]*)*'", "''")
+			s = s:gsub("%-%-.*$", "")  -- strip trailing comment
+			return s
+		end
+
 		ZukDecompile = Decompile
-		getgenv()._ZUK_DECOMPILE    = Decompile     -- expose for env.decompile override
-		getgenv()._ZUK_PRETTYPRINT  = prettyPrint   -- expose for env.decompile override
+		getgenv()._ZUK_DECOMPILE    = Decompile
+		getgenv()._ZUK_PRETTYPRINT  = prettyPrint
+	end
 	end
 	-- ── prettyPrint: adds indentation to disasm output ─────────────────────
 	local function prettyPrint(text)
@@ -18118,7 +18198,7 @@ Main = (function()
 				local okBC, bytecode = pcall(env.getscriptbytecode, scriptObj)
 				if okBC and bytecode and bytecode ~= "" then
 					local opts = {
-						DecompilerMode="disasm", DecompilerTimeout=15,
+						DecompilerMode="disasm", DecompilerTimeout=15, CleanMode=true,
 						ReaderFloatPrecision=7, ShowDebugInformation=false,
 						ShowTrivialOperations=false, ShowInstructionLines=true,
 						ShowOperationIndex=true, ShowOperationNames=true,
