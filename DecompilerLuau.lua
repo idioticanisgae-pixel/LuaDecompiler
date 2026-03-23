@@ -1176,16 +1176,14 @@ end
 local function buildReport(parsed, scriptName)
 	local lines={}
 	local function w(s) table.insert(lines,s or "") end
-	w("════════════════════════════════════════════════════")
-	w("  BYTECODE INSPECTOR — "..(scriptName or "unknown"))
-	w("════════════════════════════════════════════════════")
+	w("  BYTECODE VIEWER — "..(scriptName or "unknown"))
 	w("  Luau version : "..parsed.version)
 	w("  Types version: "..parsed.typesVersion)
 	w("  Proto count  : "..#parsed.protos)
 	w("  Entry proto  : #"..parsed.entryProto)
 	w("  Strings total: "..#parsed.stringTable)
 	w("")
-	w("── STRING TABLE ─────────────────────────────────────")
+	w("STRING TABLE")
 	for i,s in ipairs(parsed.stringTable) do w(string.format("  [%3d] %q",i,s)) end
 	w("")
 	local function walkProto(proto,idx)
@@ -1213,7 +1211,7 @@ local function buildReport(parsed, scriptName)
 		w("")
 		for i2,inner in ipairs(proto.protos) do walkProto(inner,i2) end
 	end
-	w("── PROTO TREE ───────────────────────────────────────")
+	w("PROTO TREE")
 	for i,proto in ipairs(parsed.protos) do walkProto(proto,i) end
 	return table.concat(lines,"\n")
 end
@@ -2057,7 +2055,7 @@ end)
 copyBtn.MouseButton1Click:Connect(function()
 	if _outputRaw == "" then setStatus("Nothing to copy.", COL_YELLOW); return end
 	pcall(setclipboard, _outputRaw)
-	setStatus("Copied to clipboard!")
+	setStatus("Copied")
 end)
 saveBtn.MouseButton1Click:Connect(function()
 	if _outputRaw == "" then setStatus("Nothing to save.", COL_YELLOW); return end
