@@ -16784,6 +16784,7 @@ local function main()
 						CLOSEUPVALS=true, PREPVARARGS=true, COVERAGE=true,
 						CAPTURE=true, FASTCALL=true, FASTCALL1=true,
 						FASTCALL2=true, FASTCALL2K=true, FASTCALL3=true,
+						JUMPX=true, NOP=true, JUMPBACK=true,
 					}
 					for i, action in ipairs(actions) do
 						if action.hide then continue end
@@ -17355,6 +17356,9 @@ local function main()
 	
 		local function containsOpener(s)
 			local clean = stripStrings(s)
+			-- elseif/else are already handled by DEDENT_THEN_INDENT; don't double-indent
+			local fw = clean:match("^%s*([%a_][%w_]*)")
+			if fw == "elseif" or fw == "else" then return false end
 			for w in clean:gmatch("[%a_][%w_]*") do
 				if INDENT_AFTER[w] then return true end
 				if w == "function" then return true end
@@ -17398,31 +17402,75 @@ local function main()
 			rawLines[#rawLines + 1] = line:gsub("\n$", "")
 		end
 
+		local function escpat(s)
+			return s:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
+		end
+
+		local function nextNonBlank(start)
+			local j = start
+			while j <= #rawLines and (rawLines[j] == nil or rawLines[j]:match("^%s*$")) do
+				j += 1
+			end
+			return j
+		end
+
 		-- Pass 1: collapse single-use constant loads into the next usage line
+		-- Handles: strings, numbers, booleans, nil, and bare name/import paths
 		-- e.g. v2 = "RunService" / v0 = v0:GetService(v2) → v0 = v0:GetService("RunService")
 		local function tryCollapse(i)
 			local line = rawLines[i]
 			if line == nil then return false end
 			local reg, lit = line:match('^%s*(v%d+) = (".-")%s*$')
 			if not reg then reg, lit = line:match('^%s*(v%d+) = (%-?%d+%.?%d*)%s*$') end
+			if not reg then reg, lit = line:match('^%s*(v%d+) = (true)%s*$') end
+			if not reg then reg, lit = line:match('^%s*(v%d+) = (false)%s*$') end
+			if not reg then reg, lit = line:match('^%s*(v%d+) = (nil)%s*$') end
+			-- bare import/global paths like: v2 = game.Players.LocalPlayer
+			if not reg then reg, lit = line:match('^%s*(v%d+) = ([%a_][%w_%.]+)%s*$') end
 			if not reg then return false end
-			local j = i + 1
-			while j <= #rawLines and (rawLines[j] == nil or rawLines[j]:match("^%s*$")) do
-				j += 1
-			end
+			local j = nextNonBlank(i + 1)
 			if j > #rawLines or rawLines[j] == nil then return false end
 			local nextLine = rawLines[j]
-			local escaped = reg:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
+			local ep = escpat(reg)
 			local count = 0
-			for _ in nextLine:gmatch(escaped) do count += 1 end
+			for _ in nextLine:gmatch(ep) do count += 1 end
 			if count ~= 1 then return false end
-			if nextLine:match("^%s*" .. escaped .. "%s*=") then return false end
-			rawLines[j] = nextLine:gsub(escaped, lit, 1)
+			if nextLine:match("^%s*" .. ep .. "%s*=") then return false end
+			rawLines[j] = nextLine:gsub(ep, lit, 1)
 			rawLines[i] = nil
 			return true
 		end
-		for _ = 1, 4 do
+		for _ = 1, 8 do  -- more passes for deeper constant chains
 			for i = 1, #rawLines do tryCollapse(i) end
+		end
+
+		-- Pass 1b: fold single-use field/index accesses
+		-- e.g. v3 = v2.Players / use(v3)  →  use(v2.Players)
+		local function tryFoldField(i)
+			local line = rawLines[i]
+			if not line then return false end
+			local lreg, src, field = line:match('^%s*(v%d+) = (v%d+)%.([%a_][%w_]*)%s*$')
+			if not lreg then
+				lreg, src, field = line:match('^%s*(v%d+) = (v%d+)%[(.-)%]%s*$')
+				if lreg then field = "[" .. field .. "]" else return false end
+			else
+				field = "." .. field
+			end
+			local j = nextNonBlank(i + 1)
+			if j > #rawLines then return false end
+			local nextLine = rawLines[j]
+			local epSrc = escpat(src)
+			local epReg = escpat(lreg)
+			local count = 0
+			for _ in nextLine:gmatch(epReg) do count += 1 end
+			if count ~= 1 then return false end
+			if nextLine:match("^%s*" .. epReg .. "%s*=") then return false end
+			rawLines[j] = nextLine:gsub(epReg, src .. field, 1)
+			rawLines[i] = nil
+			return true
+		end
+		for _ = 1, 6 do
+			for i = 1, #rawLines do tryFoldField(i) end
 		end
 
 		-- Pass 2: strip comment noise
@@ -17431,11 +17479,8 @@ local function main()
 			local line = rawLines[idx]
 			if line == nil then continue end
 			local stripped = line:match("^%s*(.-)%s*$")
-			-- drop standalone goto comment lines
 			if stripped:match("^%-%- goto #%d+$") then continue end
-			-- drop jump comments
 			if stripped:match("^%-%- jump") then continue end
-			-- strip inline noise from the end of lines
 			line = line:gsub("%s*%-%- goto #%d+$", "")
 			line = line:gsub("%s*%-%- end at #%d+$", "")
 			line = line:gsub("%s*%-%- iterate %+ jump to #%d+$", "")
@@ -17443,7 +17488,7 @@ local function main()
 		end
 
 		-- Pass 3: drop vN = nil lines immediately before a for loop
-		local final = {}
+		local pass3 = {}
 		local i = 1
 		while i <= #pass2 do
 			local line = pass2[i]
@@ -17454,9 +17499,31 @@ local function main()
 			if isNilInit and nextIsFor then
 				i += 1
 			else
-				final[#final + 1] = line
+				pass3[#pass3 + 1] = line
 				i += 1
 			end
+		end
+
+		-- Pass 4: insert `local` on first assignment of each vN register
+		local seen = {}
+		local pass4 = {}
+		for _, line in ipairs(pass3) do
+			local reg = line:match("^%s*(v%d+)%s*=")
+			if reg and not seen[reg] then
+				seen[reg] = true
+				line = line:gsub("^(%s*)(v%d+%s*=)", "%1local %2", 1)
+			end
+			pass4[#pass4 + 1] = line
+		end
+
+		-- Pass 5: collapse runs of multiple blank lines into one
+		local final = {}
+		local lastBlank = false
+		for _, line in ipairs(pass4) do
+			local isBlank = line:match("^%s*$") ~= nil
+			if isBlank and lastBlank then continue end
+			lastBlank = isBlank
+			final[#final + 1] = line
 		end
 
 		return table.concat(final, "\n")
