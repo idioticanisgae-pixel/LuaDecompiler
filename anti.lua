@@ -1,9 +1,3 @@
-if getgenv().__ZUKA_BYPASS_LOADED then return end
-getgenv().__ZUKA_BYPASS_LOADED = true
-if not game:IsLoaded() then game.Loaded:Wait() end
-local Players = game:GetService("Players")
-repeat task.wait(0.1) until Players.LocalPlayer
-local LocalPlayer = Players.LocalPlayer
 local _GC_START = collectgarbage("count")
 local _TIMESTAMP = os.clock()
 local set_ro = setreadonly or (make_writeable and function(t, v) if v then make_readonly(t) else make_writeable(t) end end)
@@ -20,17 +14,49 @@ local function dismantle_readonly(target)
         if mt and set_ro then set_ro(mt, false) end
     end)
 end
+dismantle_readonly(getgenv())
+dismantle_readonly(getrenv())
+dismantle_readonly(getreg())
+local function protect_interface(instance)
+    local protector = (get_hidden_gui or (syn and syn.protect_gui))
+    if protector then pcall(protector, instance) end
+end
+local function get_memory_signature(target_name)
+    local found = 0
+    for _, obj in ipairs(getgc(true)) do
+        if type(obj) == "function" then
+            local info = debug.getinfo(obj)
+            if info.name == target_name or (info.source and info.source:find(target_name)) then
+                found = found + 1
+            end
+        end
+    end
+    return found
+end
+local Services = setmetatable({}, {
+    __index = function(t, k)
+        local s = game:GetService(k)
+        if s then t[k] = s end
+        return s
+    end
+})
+if getgenv().__ZUKA_BYPASS_LOADED then return end
+getgenv().__ZUKA_BYPASS_LOADED = true
+if not game:IsLoaded() then game.Loaded:Wait() end
+local Players = game:GetService("Players")
+repeat task.wait(0.1) until Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer
 local newcc = newcclosure or function(f) return f end
 local hookf = hookfunction
 local get_mt = getrawmetatable
 local set_ro = setreadonly
 local gc = getgc or get_gc_objects
 local Stats = {
-KickAttempts = 0,
-RemotesBlocked = 0,
-DetectionsCaught = 0,
-FunctionsHooked = 0,
-ClientChecksBlocked = 0,
+    KickAttempts = 0,
+    RemotesBlocked = 0,
+    DetectionsCaught = 0,
+    FunctionsHooked = 0,
+    ClientChecksBlocked = 0,
 }
 local HookedFunctions = {}
 local function safeHook(fn, replacement)
@@ -43,22 +69,22 @@ local function safeHook(fn, replacement)
 end
 local function safeInspectTable(v)
     local ok, hasDetected, hasRemovePlayer, hasCheckAllClients,
-    hasKickedPlayers, hasSpoofCache, hasTimeoutLimit = pcall(function()
+          hasKickedPlayers, hasSpoofCache, hasTimeoutLimit = pcall(function()
         return
-        type(rawget(v, "Detected")) == "function",
-        type(rawget(v, "RemovePlayer")) == "function",
-        type(rawget(v, "CheckAllClients")) == "function",
-        rawget(v, "KickedPlayers") ~= nil,
-        rawget(v, "SpoofCheckCache") ~= nil,
-        rawget(v, "ClientTimeoutLimit") ~= nil
+            type(rawget(v, "Detected")) == "function",
+            type(rawget(v, "RemovePlayer")) == "function",
+            type(rawget(v, "CheckAllClients")) == "function",
+            rawget(v, "KickedPlayers") ~= nil,
+            rawget(v, "SpoofCheckCache") ~= nil,
+            rawget(v, "ClientTimeoutLimit") ~= nil
     end)
     if not ok then return 0 end
     return (hasDetected and 1 or 0)
-    + (hasRemovePlayer and 1 or 0)
-    + (hasCheckAllClients and 1 or 0)
-    + (hasKickedPlayers and 1 or 0)
-    + (hasSpoofCache and 1 or 0)
-    + (hasTimeoutLimit and 1 or 0)
+        + (hasRemovePlayer and 1 or 0)
+        + (hasCheckAllClients and 1 or 0)
+        + (hasKickedPlayers and 1 or 0)
+        + (hasSpoofCache and 1 or 0)
+        + (hasTimeoutLimit and 1 or 0)
 end
 local function findACTable()
     local objects
@@ -92,12 +118,12 @@ local function hookACTable(tbl)
         end)
     end
     if type(tbl.UserSpoofCheck) == "function" then
-        safeHook(tbl.UserSpoofCheck, function(p, .. .)
+        safeHook(tbl.UserSpoofCheck, function(p, ...)
             return nil
         end)
     end
     if type(tbl.CharacterCheck) == "function" then
-        safeHook(tbl.CharacterCheck, function(player, .. .)
+        safeHook(tbl.CharacterCheck, function(player, ...)
         end)
     end
     if type(tbl.KickedPlayers) == "table" then
@@ -110,9 +136,9 @@ local function hookACTable(tbl)
         local mt = {}
         rawset(mt, "__index", function(t, k)
             return {{
-            Id = k,
-            Username = LocalPlayer.Name,
-            DisplayName = LocalPlayer.DisplayName
+                Id = k,
+                Username = LocalPlayer.Name,
+                DisplayName = LocalPlayer.DisplayName
             }}
         end)
         setmetatable(tbl.SpoofCheckCache, mt)
@@ -157,90 +183,92 @@ local function installNamecallHook()
     if not mt then return end
     local oldNamecall = mt.__namecall
     set_ro(mt, false)
-    mt.__namecall = newcc(function(self, .. .)
+    mt.__namecall = newcc(function(self, ...)
         local method = getnamecallmethod()
-        local args = { .. .}
+        local args = {...}
         if checkcaller() then
-            return oldNamecall(self, .. .)
+            return oldNamecall(self, ...)
         end
         if method == "Kick" and self == LocalPlayer then
             local msg = tostring(args[1] or ""):lower()
             if msg:find("adonis") or msg:find("anti cheat") or
-            msg:find("detected") or msg:find("exploit") or
-            msg:find("acli") then
-            Stats.KickAttempts = Stats.KickAttempts + 1
-            return nil
-        end
-    end
-    if method == "FireServer" or method == "InvokeServer" then
-        local name = self.Name
-        local blocked = {
-        ["__FUNCTION"] = true,
-        ["_FUNCTION"] = true,
-        ["ClientCheck"] = true,
-        ["ProcessCommand"] = true,
-        ["LogError"] = true,
-        ["ClientLoaded"] = true,
-        ["ClientKick"] = true,
-        ["Disconnect"] = true,
-        }
-        if blocked[name] then
-            Stats.RemotesBlocked = Stats.RemotesBlocked + 1
-            if method == "InvokeServer" then
-                return "Pong"
+               msg:find("detected") or msg:find("exploit") or
+               msg:find("acli") then
+                Stats.KickAttempts = Stats.KickAttempts + 1
+                return nil
             end
-            return nil
         end
-    end
-    return oldNamecall(self, .. .)
-end)
-set_ro(mt, true)
+        if method == "FireServer" or method == "InvokeServer" then
+            local name = self.Name
+            local blocked = {
+                ["__FUNCTION"] = true,
+                ["_FUNCTION"] = true,
+                ["ClientCheck"] = true,
+                ["ProcessCommand"] = true,
+                ["LogError"] = true,
+                ["ClientLoaded"] = true,
+                ["Kick"] = true,
+                ["ActivateCommand"] = true,
+                ["Disconnect"] = true,
+
+            }
+            if blocked[name] then
+                Stats.RemotesBlocked = Stats.RemotesBlocked + 1
+                if method == "InvokeServer" then
+                    return "Pong"
+                end
+                return nil
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    set_ro(mt, true)
 end
 local function installDebugHooks()
     local oldInfo = debug.info or debug.getinfo
     if oldInfo then
-        pcall(hookf, oldInfo, newcc(function(fn, .. .)
+        pcall(hookf, oldInfo, newcc(function(fn, ...)
             for _, hooked in ipairs(HookedFunctions) do
                 if fn == hooked then return nil end
             end
-            return oldInfo(fn, .. .)
+            return oldInfo(fn, ...)
         end))
     end
     if debug.getupvalues then
-        pcall(hookf, debug.getupvalues, newcc(function(fn, .. .)
+        pcall(hookf, debug.getupvalues, newcc(function(fn, ...)
             for _, hooked in ipairs(HookedFunctions) do
                 if fn == hooked then return {} end
             end
-            return debug.getupvalues(fn, .. .)
+            return debug.getupvalues(fn, ...)
         end))
     end
     if debug.getlocals then
-        pcall(hookf, debug.getlocals, newcc(function(fn, .. .)
+        pcall(hookf, debug.getlocals, newcc(function(fn, ...)
             for _, hooked in ipairs(HookedFunctions) do
                 if fn == hooked then return {} end
             end
-            return debug.getlocals(fn, .. .)
+            return debug.getlocals(fn, ...)
         end))
     end
 end
 local function protectKick()
     local origKick = LocalPlayer.Kick
-    safeHook(origKick, function(self, reason, .. .)
+    safeHook(origKick, function(self, reason, ...)
         local msg = tostring(reason or ""):lower()
         if msg:find("adonis") or msg:find("anti cheat") or
-        msg:find("exploit") or msg:find("acli") or
-        msg:find("cheat") then
-        Stats.KickAttempts = Stats.KickAttempts + 1
-        return nil
-    end
-    return origKick(self, reason, .. .)
-end)
-task.spawn(function()
-    while task.wait(5) do
-        if LocalPlayer and LocalPlayer.Parent then
+           msg:find("exploit") or msg:find("acli") or
+           msg:find("cheat") then
+            Stats.KickAttempts = Stats.KickAttempts + 1
+            return nil
         end
-    end
-end)
+        return origKick(self, reason, ...)
+    end)
+    task.spawn(function()
+        while task.wait(5) do
+            if LocalPlayer and LocalPlayer.Parent then
+            end
+        end
+    end)
 end
 local oldRequire
 oldRequire = hookf(getrenv().require, newcc(function(module)
@@ -282,22 +310,30 @@ local function initialize()
     task.spawn(function()
         while task.wait(60) do
             print(string.format(
-            "[AntiAdonis] Blocked Adonis.",
-            Stats.KickAttempts, Stats.RemotesBlocked, Stats.DetectionsCaught,
-            Stats.ClientChecksBlocked, Stats.FunctionsHooked
+                "[AntiAdonis] Blocked Adonis.",
+                Stats.KickAttempts, Stats.RemotesBlocked, Stats.DetectionsCaught,
+                Stats.ClientChecksBlocked, Stats.FunctionsHooked
             ))
         end
     end)
 end
 getgenv().AntiAdonis = {
-Version = "1.0",
-Stats = Stats,
-Rescan = function()
-    rescan()
-end,
-GetStats = function()
-    return Stats
-end
+    Version = "1.0",
+    Stats = Stats,
+    Rescan = function()
+        rescan()
+        warn("[AntiAdonis] rescan complete")
+    end,
+    GetStats = function()
+        return Stats
+    end
 }
 initialize()
 print("Success")
+local oldKick
+oldKick = hookfunction(LocalPlayer.Kick, newcclosure(function(self, ...)
+    if not checkcaller() and self == LocalPlayer then
+        return nil
+    end
+    return oldKick(self, ...)
+end))
