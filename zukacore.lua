@@ -5,7 +5,7 @@
 
 
   
-   "  Usage (CLI): lua zukv2.lua <bytecode_file> [options]  "
+   "  Usage (CLI): lua zukacore.lua <bytecode_file> [options]  "
 
 
       Options:
