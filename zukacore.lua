@@ -1,11 +1,14 @@
---[[
-  ZUKv2 CORE — Luau bytecode disassembler
-  Compatible: Luau (Roblox executors), Lua 5.1, Lua 5.2, Lua 5.3, Lua 5.4
+--[[ 
 
-  Usage (CLI):
-    lua zukv2.lua <bytecode_file> [options]
 
-  Options:
+  zukv2 Core     
+
+
+  
+   "  Usage (CLI): lua zukv2.lua <bytecode_file> [options]  "
+
+
+      Options:
     --mode disasm       disassembly (default)
     --clean             enable clean / prettified output
     --no-globals        suppress used-globals header
@@ -17,30 +20,17 @@
     --show-opnames      show raw opcode names
     --show-trivial      show trivial (bookkeeping) ops
     --no-typeinfo       disable type annotation output
+	
+	
+	]]
 
-  As a module:
-    local zuk = require("zukv2")
-    local result = zuk.decompile(bytecodeString, options)
-    local pretty  = zuk.prettyPrint(result)
-    local clean   = zuk.cleanOutput(result)
-]]
-
--- ── Runtime detection ────────────────────────────────────────────────────────
--- Detect Luau, LuaJIT (bit lib), or plain Lua 5.1/5.2/5.3/5.4
-local _LUAU   = type(bit32) == "table" and bit32.band ~= nil  -- Luau exposes bit32 natively
+local _LUAU   = type(bit32) == "table" and bit32.band ~= nil
 local _LUA51  = (not _LUAU) and (_VERSION == "Lua 5.1")
 local _LUAJIT = (not _LUAU) and (type(jit) == "table")
-
--- ── Pure-Lua bit32 shim (used when not running on Luau/5.2+/LuaJIT) ─────────
--- Under Luau the native bit32 library is already present; we only build the
--- shim when running under a plain Lua without bitwise operators.
-
 local bit32
 do
-  -- Try to pick up an existing bit32 (Lua 5.2 / Luau)
   if type(_G.bit32) == "table" then
     bit32 = _G.bit32
-  -- LuaJIT / Lua 5.1 executor with "bit" library
   elseif type(_G.bit) == "table" then
     local b = _G.bit
     bit32 = {
@@ -91,7 +81,6 @@ do
       end,
     }
   else
-    -- Pure-Lua fallback using multiplication/modulo (works on all versions)
     local function uint32(n)
       n = n % 0x100000000
       if n < 0 then n = n + 0x100000000 end
@@ -185,69 +174,52 @@ do
     }
   end
 end
-
--- ── Helper: portable integer right-shift wrapper ─────────────────────────────
 local function bshr(a, n) return bit32.rshift(a, n) end
 local function bshl(a, n) return bit32.lshift(a, n) end
 local function band(a, b) return bit32.band(a, b) end
 local function bor(a, b)  return bit32.bor(a, b) end
-
--- ── Lua 5.1 / unpack compat ──────────────────────────────────────────────────
 local _unpack = table.unpack or unpack
-
--- ── Binary reader (replaces Roblox buffer.*) ─────────────────────────────────
 local Reader = {}
 Reader.__index = Reader
-
 function Reader.new(bytes)
   return setmetatable({ _bytes = bytes, _pos = 1, _len = #bytes }, Reader)
 end
-
 function Reader:len()  return self._len end
-
 local function _checkbounds(self, n)
   if self._pos + n - 1 > self._len then
     error(string.format("Reader OOB: need %d byte(s) at offset %d (buf len %d)",
       n, self._pos - 1, self._len), 3)
   end
 end
-
 function Reader:nextByte()
   _checkbounds(self, 1)
   local b = string.byte(self._bytes, self._pos)
   self._pos = self._pos + 1
   return b
 end
-
 function Reader:nextSignedByte()
   local b = self:nextByte()
   if b >= 128 then return b - 256 end
   return b
 end
-
 function Reader:nextBytes(count)
   local t = {}
   for i = 1, count do t[i] = self:nextByte() end
   return t
 end
-
 function Reader:nextChar()  return string.char(self:nextByte()) end
-
 function Reader:nextUInt32()
   _checkbounds(self, 4)
   local a, b, c, d = string.byte(self._bytes, self._pos, self._pos + 3)
   self._pos = self._pos + 4
   return bor(a, bor(bshl(b, 8), bor(bshl(c, 16), bshl(d, 24))))
 end
-
 function Reader:nextInt32()
   local v = self:nextUInt32()
   if v >= 0x80000000 then return v - 0x100000000 end
   return v
 end
-
 function Reader:nextFloat()
-  -- IEEE 754 single (4 bytes, little-endian)
   _checkbounds(self, 4)
   local a, b, c, d = string.byte(self._bytes, self._pos, self._pos + 3)
   self._pos = self._pos + 4
@@ -265,7 +237,6 @@ function Reader:nextFloat()
   end
   return value
 end
-
 function Reader:nextVarInt()
   local result = 0
   for i = 0, 4 do
@@ -275,7 +246,6 @@ function Reader:nextVarInt()
   end
   return result
 end
-
 function Reader:nextString(slen)
   slen = slen or self:nextVarInt()
   if slen == 0 then return "" end
@@ -284,22 +254,16 @@ function Reader:nextString(slen)
   self._pos = self._pos + slen
   return s
 end
-
 function Reader:nextDouble()
-  -- IEEE 754 double (8 bytes, little-endian)
-  -- We reconstruct the value directly from the two 32-bit halves
   _checkbounds(self, 8)
   local bytes = { string.byte(self._bytes, self._pos, self._pos + 7) }
   self._pos = self._pos + 8
-  -- lo = bytes 1-4, hi = bytes 5-8
   local lo = bor(bytes[1], bor(bshl(bytes[2], 8), bor(bshl(bytes[3], 16), bshl(bytes[4], 24))))
   local hi = bor(bytes[5], bor(bshl(bytes[6], 8), bor(bshl(bytes[7], 16), bshl(bytes[8], 24))))
-  -- make both unsigned
   if lo < 0 then lo = lo + 0x100000000 end
   if hi < 0 then hi = hi + 0x100000000 end
   local sign = (bshr(hi, 31) == 1) and -1 or 1
   local exp  = band(bshr(hi, 20), 0x7FF)
-  -- fractional mantissa: top 20 bits from hi, all 32 bits of lo
   local frac_hi = band(hi, 0x000FFFFF)
   local frac = frac_hi * (2^32) + lo
   if exp == 0 then
@@ -310,12 +274,8 @@ function Reader:nextDouble()
     return sign * (1 + frac / (2^52)) * 2^(exp - 1023)
   end
 end
-
--- ── Core decompiler ───────────────────────────────────────────────────────────
 local FLOAT_PRECISION = 7
-
 local function Reader_Set(fp) FLOAT_PRECISION = fp end
-
 local Strings = {
   SUCCESS             = "%s",
   TIMEOUT             = "-- DECOMPILER TIMEOUT",
@@ -324,9 +284,7 @@ local Strings = {
   USED_GLOBALS        = "-- USED GLOBALS: %s.\n",
   DECOMPILER_REMARK   = "-- DECOMPILER REMARK: %s\n",
 }
-
 local CASE_MULTIPLIER = 227
-
 local Luau = {
   OpCode = {
     {name="NOP",type="none"},{name="BREAK",type="none"},
@@ -387,7 +345,7 @@ local Luau = {
     LBC_TYPE_TABLE=4,LBC_TYPE_FUNCTION=5,LBC_TYPE_THREAD=6,LBC_TYPE_USERDATA=7,
     LBC_TYPE_VECTOR=8,LBC_TYPE_BUFFER=9,LBC_TYPE_ANY=15,
     LBC_TYPE_TAGGED_USERDATA_BASE=64,LBC_TYPE_TAGGED_USERDATA_END=64+32,
-    LBC_TYPE_OPTIONAL_BIT=0,  -- set after table init below
+    LBC_TYPE_OPTIONAL_BIT=0,
   },
   CaptureType  = {LCT_VAL=0,LCT_REF=1,LCT_UPVAL=2},
   BuiltinFunction = {
@@ -425,10 +383,8 @@ local Luau = {
     LPF_NATIVE_FUNCTION = bit32.lshift(1,2),
   },
 }
--- Deferred init: bit32 is available now
 Luau.BytecodeType.LBC_TYPE_OPTIONAL_BIT = bit32.lshift(1, 7)
 Luau.BytecodeType.LBC_TYPE_INVALID = 256
-
 function Luau:INSN_OP(i)  return band(i, 0xFF) end
 function Luau:INSN_A(i)   return band(bshr(i, 8), 0xFF) end
 function Luau:INSN_B(i)   return band(bshr(i, 16), 0xFF) end
@@ -439,7 +395,6 @@ function Luau:INSN_sD(i)
   return (D > 0x7FFF and D <= 0xFFFF) and (-(0xFFFF - D) - 1) or D
 end
 function Luau:INSN_E(i)   return bshr(i, 8) end
-
 function Luau:GetBaseTypeString(t, checkOpt)
   local BT = self.BytecodeType
   local tag = band(t, band(bit32.bnot(BT.LBC_TYPE_OPTIONAL_BIT), 0xFF))
@@ -457,7 +412,6 @@ function Luau:GetBaseTypeString(t, checkOpt)
   end
   return r
 end
-
 function Luau:GetBuiltinInfo(bfid)
   local BF = self.BuiltinFunction
   local map = {
@@ -510,8 +464,6 @@ function Luau:GetBuiltinInfo(bfid)
   }
   return map[bfid] or ("builtin#"..tostring(bfid))
 end
-
--- Encode OpCode table with case multiplier
 do
   local raw = Luau.OpCode
   local encoded = {}
@@ -521,7 +473,6 @@ do
   end
   Luau.OpCode = encoded
 end
-
 local DEFAULT_OPTIONS = {
   EnabledRemarks       = {ColdRemark=false, InlineRemark=true},
   DecompilerTimeout    = 10,
@@ -537,13 +488,11 @@ local DEFAULT_OPTIONS = {
   ReturnElapsedTime    = false,
   CleanMode            = true,
 }
-
 local LuauOpCode       = Luau.OpCode
 local LuauBytecodeTag  = Luau.BytecodeTag
 local LuauBytecodeType = Luau.BytecodeType
 local LuauCaptureType  = Luau.CaptureType
 local LuauProtoFlag    = Luau.ProtoFlag
-
 local function toBoolean(v)     return v ~= 0 end
 local function toEscapedString(v)
   if type(v) == "string" then return string.format("%q", v) end
@@ -561,7 +510,6 @@ end
 local function padRight(v, ch, n)
   local s = tostring(v); return s .. string.rep(ch, math.max(0, n - #s))
 end
-
 local ROBLOX_GLOBALS = {
   "game","workspace","script","plugin","settings","shared","UserSettings",
   "print","warn","error","assert","pcall","xpcall","require","select",
@@ -577,12 +525,10 @@ local function isGlobal(key)
   for _, v in ipairs(ROBLOX_GLOBALS) do if v == key then return true end end
   return false
 end
-
 local function Decompile(bytecode, options)
   local bytecodeVersion, typeEncodingVersion
   Reader_Set(options.ReaderFloatPrecision)
   local reader = Reader.new(bytecode)
-
   local function disassemble()
     if bytecodeVersion >= 4 then
       typeEncodingVersion = reader:nextByte()
@@ -761,7 +707,6 @@ local function Decompile(bytecode, options)
     local mainProtoId = reader:nextVarInt()
     return mainProtoId, protoTable
   end
-
   local function organize()
     local mainProtoId, protoTable = disassemble()
     local mainProto = protoTable[mainProtoId]
@@ -812,7 +757,7 @@ local function Decompile(bytecode, options)
           })
         end
         for idx, instruction in ipairs(instructions) do
-          repeat  -- repeat/until true used as a continue-able block (break = continue)
+          repeat
           if auxSkip then auxSkip=false; break end
           local oci = LuauOpCode[Luau:INSN_OP(instruction)]
           if not oci then break end
@@ -919,7 +864,7 @@ local function Decompile(bytecode, options)
             local r3=bshr(r2,8)
             reg(oci,{B,r2,r3},{A,C},st)
           end
-          until true  -- end of continue block
+          until true
         end
       end
       writeFlags()
@@ -928,7 +873,6 @@ local function Decompile(bytecode, options)
     baseProto(mainProto)
     return mainProtoId, registerActions, protoTable
   end
-
   local function finalize(mainProtoId, registerActions, protoTable)
     local finalResult = ""
     local totalParameters = 0
@@ -961,7 +905,6 @@ local function Decompile(bytecode, options)
         local function makeJump(idx) idx=idx-1; jumpMarkers[idx]=(jumpMarkers[idx] or 0)+1 end
         totalParameters = totalParameters + numParams
         if proto.main and pflags and pflags.native then emit("--!native\n") end
-
         local function buildRegNames(instrIdx)
           local names = {}
           if proto.debugLocals then
@@ -1093,7 +1036,7 @@ local function Decompile(bytecode, options)
           JUMPX=true, NOP=true, JUMPBACK=true,
         }
         for i, action in ipairs(actions) do
-          repeat  -- repeat/until true used as a continue-able block (break = continue)
+          repeat
           if action.hide then break end
           local ur  = action.usedRegisters
           local ed  = action.extraData
@@ -1384,7 +1327,7 @@ local function Decompile(bytecode, options)
           end
           emit("\n")
           handleJumps()
-          until true  -- end of continue block
+          until true
         end
       end
       writeActions(registerActions[mainProtoId])
@@ -1394,7 +1337,6 @@ local function Decompile(bytecode, options)
     end
     return finalResult
   end
-
   local function manager(proceed, issue)
     if proceed then
       local startTime = os.clock()
@@ -1413,7 +1355,6 @@ local function Decompile(bytecode, options)
       end
     end
   end
-
   bytecodeVersion = reader:nextByte()
   if bytecodeVersion == 0 then
     return manager(false, "COMPILATION_FAILURE")
@@ -1424,16 +1365,12 @@ local function Decompile(bytecode, options)
     return manager(false, "UNSUPPORTED_LBC_VERSION")
   end
 end
-
--- ── Pretty-printer ────────────────────────────────────────────────────────────
 local function prettyPrint(text)
   local result = {}
   local depth  = 0
-
   local DEDENT_BEFORE      = { ["end"]=true, ["until"]=true }
   local INDENT_AFTER       = { ["then"]=true, ["do"]=true, ["repeat"]=true }
   local DEDENT_THEN_INDENT = { ["else"]=true, ["elseif"]=true }
-
   local function stripStrings(s)
     s = s:gsub('"[^"]*"', '""')
     s = s:gsub("'[^']*'", "''")
@@ -1453,7 +1390,6 @@ local function prettyPrint(text)
     end
     return false
   end
-
   for line in (text .. "\n"):gmatch("[^\n]*\n") do
     local bare = line:gsub("\n$", "")
     if bare == "" then
@@ -1461,7 +1397,6 @@ local function prettyPrint(text)
     else
       local expr = bare:match("^%[%d+%]%s*:?%d*:?%s*%u[%u_]*%s+(.*)") or bare
       local kw = firstWord(expr)
-
       if DEDENT_THEN_INDENT[kw] then
         depth = math.max(0, depth - 1)
         result[#result+1] = string.rep("    ", depth) .. bare .. "\n"
@@ -1475,17 +1410,13 @@ local function prettyPrint(text)
       end
     end
   end
-
   return table.concat(result)
 end
-
--- ── Clean-output pass ─────────────────────────────────────────────────────────
 local function cleanOutput(text)
   local rawLines = {}
   for line in (text .. "\n"):gmatch("[^\n]*\n") do
     rawLines[#rawLines+1] = line:gsub("\n$", "")
   end
-
   local function escpat(s)
     return s:gsub("([%(%)%.%%%+%-%*%?%[%^%$])", "%%%1")
   end
@@ -1496,7 +1427,6 @@ local function cleanOutput(text)
     end
     return j
   end
-
   local function tryCollapse(i)
     local line = rawLines[i]
     if line == nil then return false end
@@ -1526,7 +1456,6 @@ local function cleanOutput(text)
   for _ = 1, 8 do
     for i = 1, #rawLines do tryCollapse(i) end
   end
-
   local function tryFoldField(i)
     local line = rawLines[i]
     if not line then return false end
@@ -1558,7 +1487,6 @@ local function cleanOutput(text)
   for _ = 1, 6 do
     for i = 1, #rawLines do tryFoldField(i) end
   end
-
   local pass2 = {}
   for idx = 1, #rawLines do
     local line = rawLines[idx]
@@ -1572,7 +1500,6 @@ local function cleanOutput(text)
       end
     end
   end
-
   local pass3 = {}
   local i = 1
   while i <= #pass2 do
@@ -1584,7 +1511,6 @@ local function cleanOutput(text)
     if isNilInit and nextIsFor then i = i + 1
     else pass3[#pass3+1] = line; i = i + 1 end
   end
-
   local seen = {}
   local pass4 = {}
   for _, line in ipairs(pass3) do
@@ -1595,7 +1521,6 @@ local function cleanOutput(text)
     end
     pass4[#pass4+1] = line
   end
-
   local final = {}
   local lastBlank = false
   for _, line in ipairs(pass4) do
@@ -1605,13 +1530,9 @@ local function cleanOutput(text)
       final[#final+1] = line
     end
   end
-
   return table.concat(final, "\n")
 end
-
--- ── Public module API ─────────────────────────────────────────────────────────
 local M = {}
-
 function M.decompile(bytecode, opts)
   local options = {}
   for k, v in pairs(DEFAULT_OPTIONS) do options[k] = v end
@@ -1620,26 +1541,15 @@ function M.decompile(bytecode, opts)
   end
   return Decompile(bytecode, options)
 end
-
 M.prettyPrint  = prettyPrint
 M.cleanOutput  = cleanOutput
 M.DEFAULT_OPTIONS = DEFAULT_OPTIONS
-
--- ── CLI entry point ───────────────────────────────────────────────────────────
--- Only run when executed directly (not required as a module).
--- Uses a portable check: Luau executors don't have `arg`, and `io`/`os.exit`
--- may not be available — we guard every call so the module is safe to require.
 local _isMain = false
--- arg[0] is the script name only when run directly as `lua script.lua`
--- When dofile/require is used, arg may still be a table but arg[0] is the
--- parent script, not this file. We use debug.getinfo to check reliably.
 if debug and type(debug.getinfo) == "function" then
   local ok, info = pcall(debug.getinfo, 1, "S")
   if ok and info and info.what == "main" then
-    -- Further confirm by matching arg[0] to source name if available
     if type(arg) == "table" and type(arg[0]) == "string" then
       local src = info.source or ""
-      -- info.source starts with '@' for file-based chunks
       if src:sub(1,1) == "@" then
         local srcFile = src:sub(2):match("[^/\\]+$") or src:sub(2)
         local argFile = (arg[0] or ""):match("[^/\\]+$") or (arg[0] or "")
@@ -1650,15 +1560,12 @@ if debug and type(debug.getinfo) == "function" then
     end
   end
 elseif type(arg) == "table" then
-  -- No debug lib (some stripped builds) – best-effort
   _isMain = true
 end
-
 if _isMain and type(io) == "table" and type(os) == "table" then
   local args = arg or {}
   local filepath = nil
   local opts = {}
-
   local i = 1
   while i <= #args do
     local a = args[i]
@@ -1695,12 +1602,10 @@ if _isMain and type(io) == "table" and type(os) == "table" then
     end
     i = i + 1
   end
-
   if not filepath then
     io.stderr:write("Usage: lua zukv2.lua <bytecode_file> [options]\n")
     os.exit(1)
   end
-
   local f, err = io.open(filepath, "rb")
   if not f then
     io.stderr:write("Error opening file: " .. tostring(err) .. "\n")
@@ -1708,15 +1613,11 @@ if _isMain and type(io) == "table" and type(os) == "table" then
   end
   local bytecode = f:read("*a")
   f:close()
-
   local result = M.decompile(bytecode, opts)
-
   if opts.CleanMode then
     result = prettyPrint(result)
     result = cleanOutput(result)
   end
-
   io.write(result)
 end
-
 return M
